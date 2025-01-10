@@ -1,0 +1,412 @@
+import os
+import pandas as pd
+import numpy as np
+from sklearn.model_selection import train_test_split
+from sklearn.ensemble import RandomForestClassifier, VotingClassifier
+from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score
+from sklearn.preprocessing import StandardScaler, OneHotEncoder
+from xgboost import XGBClassifier
+from sklearn.inspection import permutation_importance
+from sklearn.compose import ColumnTransformer
+from sklearn.pipeline import Pipeline
+from joblib import Parallel, delayed
+import multiprocessing
+from ta import trend, momentum, volatility
+from tqdm import tqdm
+import matplotlib.pyplot as plt
+import seaborn as sns
+import json
+
+# Set the path to your data directory
+data_dir = r"C:\Users\shubh\.cursor-tutor\stock_data"
+
+def load_and_prepare_data(file_path):
+    data = pd.read_csv(file_path)
+    data['Date'] = pd.to_datetime(data['Date'])
+    
+    # Check if the Date column is already timezone-aware
+    if data['Date'].dt.tz is None:
+        data['Date'] = data['Date'].dt.tz_localize('UTC')  # Set timezone to UTC
+    else:
+        data['Date'] = data['Date'].dt.tz_convert('UTC')  # Convert to UTC if already aware
+    
+    data.set_index('Date', inplace=True)
+    return data
+
+def calculate_alpha(stock_data, benchmark_data, horizon):
+    stock_returns = stock_data['Close'].pct_change(horizon)
+    benchmark_returns = benchmark_data['Close'].pct_change(horizon)
+    alpha = stock_returns - benchmark_returns
+    return alpha
+
+def create_features(data, fundamental_data, symbol):
+    data['Returns'] = data['Close'].pct_change()
+    data['Log_Returns'] = np.log(data['Close'] / data['Close'].shift(1))
+    data['Volatility'] = data['Log_Returns'].rolling(window=20).std() * np.sqrt(252)
+    data['MA50'] = data['Close'].rolling(window=50).mean()
+    data['MA200'] = data['Close'].rolling(window=200).mean()
+    data['RSI'] = calculate_rsi(data['Close'])
+    data['Price_to_MA50'] = data['Close'] / data['MA50']
+    data['Price_to_MA200'] = data['Close'] / data['MA200']
+    
+    # Add fundamental features if available
+    if symbol in fundamental_data:
+        for key, value in fundamental_data[symbol].items():
+            if key not in data.columns:  # Only add if not already present
+                data[key] = value
+    
+    return data
+
+def calculate_rsi(prices, period=14):
+    delta = prices.diff()
+    gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
+    loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
+    rs = gain / loss
+    return 100 - (100 / (1 + rs))
+
+def prepare_model_data(stock_data, benchmark_data, horizon):
+    alpha = calculate_alpha(stock_data, benchmark_data, horizon)
+    stock_data[f'Target_{horizon}'] = (alpha > 0).astype(int)
+    base_features = ['Returns', 'Log_Returns', 'Volatility', 'MA50', 'MA200', 'RSI', 'Price_to_MA50', 'Price_to_MA200']
+    fundamental_features = ['P/E_Ratio', 'Revenue_Growth', 'Debt_to_Equity']
+    
+    # Only include features that are actually present in the data
+    feature_columns = [col for col in base_features + fundamental_features if col in stock_data.columns]
+    
+    X = stock_data[feature_columns].dropna()
+    y = stock_data[f'Target_{horizon}'].loc[X.index]
+    return X, y
+
+def classify_market_condition(returns, window=30):
+    rolling_returns = returns.rolling(window=window).mean()
+    conditions = [
+        (rolling_returns > 0.01),
+        (rolling_returns < -0.01),
+        (rolling_returns.between(-0.01, 0.01))
+    ]
+    choices = ['bull', 'bear', 'neutral']
+    market_condition = pd.Series(np.select(conditions, choices, default='neutral'), index=returns.index)
+    return market_condition
+
+def create_ensemble_model():
+    rf = RandomForestClassifier(n_estimators=100, random_state=42)
+    xgb = XGBClassifier(n_estimators=100, random_state=42)
+    
+    ensemble = VotingClassifier(
+        estimators=[('rf', rf), ('xgb', xgb)],
+        voting='soft'
+    )
+    
+    return ensemble
+
+def create_preprocessor(X):
+    numeric_features = X.select_dtypes(include=['int64', 'float64']).columns.tolist()
+    categorical_features = X.select_dtypes(include=['object', 'category']).columns.tolist()
+
+    numeric_transformer = StandardScaler()
+    categorical_transformer = OneHotEncoder(drop='first', sparse_output=False, handle_unknown='ignore')
+
+    preprocessor = ColumnTransformer(
+        transformers=[
+            ('num', numeric_transformer, numeric_features),
+            ('cat', categorical_transformer, categorical_features)
+        ])
+
+    return preprocessor
+
+def train_and_evaluate_model(X, y, test_size=0.2):
+    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=test_size, shuffle=False)
+    
+    preprocessor = create_preprocessor(X_train)
+    model = create_ensemble_model()
+    
+    pipeline = Pipeline([
+        ('preprocessor', preprocessor),
+        ('classifier', model)
+    ])
+    
+    pipeline.fit(X_train, y_train)
+    
+    y_pred = pipeline.predict(X_test)
+    
+    accuracy = accuracy_score(y_test, y_pred)
+    precision = precision_score(y_test, y_pred)
+    recall = recall_score(y_test, y_pred)
+    f1 = f1_score(y_test, y_pred)
+    
+    print(f"Test period: {X_test.index[0]} to {X_test.index[-1]}")
+    print(f"Accuracy: {accuracy:.4f}")
+    print(f"Precision: {precision:.4f}")
+    print(f"Recall: {recall:.4f}")
+    print(f"F1 Score: {f1:.4f}")
+    
+    return pipeline
+
+def feature_importance_analysis(pipeline, X, y):
+    perm_importance = permutation_importance(pipeline, X, y, n_repeats=10, random_state=42)
+    feature_importance = pd.DataFrame({
+        'feature': X.columns,
+        'importance': perm_importance.importances_mean
+    }).sort_values('importance', ascending=False)
+    
+    print("\nFeature Importance:")
+    print(feature_importance)
+
+def simple_backtest(X, y, window_size=126, step_size=30):
+    results = []
+    for i in tqdm(range(window_size, len(X), step_size)):
+        X_train, y_train = X.iloc[:i], y.iloc[:i]
+        X_test, y_test = X.iloc[i:i+step_size], y.iloc[i:i+step_size]
+        
+        if X_test.empty or y_test.empty:
+            continue
+        
+        try:
+            preprocessor = create_preprocessor(X_train)
+            model = create_ensemble_model()
+            
+            pipeline = Pipeline([
+                ('preprocessor', preprocessor),
+                ('classifier', model)
+            ])
+            
+            pipeline.fit(X_train, y_train)
+            y_pred = pipeline.predict(X_test)
+            accuracy = accuracy_score(y_test, y_pred)
+            results.append({
+                'start_date': X_test.index[0],
+                'end_date': X_test.index[-1],
+                'accuracy': accuracy
+            })
+        except Exception as e:
+            print(f"Error in backtesting at index {i}: {str(e)}")
+            continue
+    
+    return pd.DataFrame(results)
+
+def load_and_prepare_all_data(data_dir, top_n=40):
+    nifty500_path = os.path.join(data_dir, 'NIFTY500_data.csv')
+    nifty500_data = load_and_prepare_data(nifty500_path)
+    
+    fundamental_data = load_fundamental_data(data_dir)
+    
+    stock_files = [f for f in os.listdir(data_dir) if f.endswith('.csv') and f != 'NIFTY500_data.csv']
+    top_n_stocks = sorted(stock_files)[:top_n]
+    
+    all_stock_data = {}
+    for stock_file in top_n_stocks:
+        stock_path = os.path.join(data_dir, stock_file)
+        stock_data = load_and_prepare_data(stock_path)
+        symbol = stock_file.split('_')[0]
+        all_stock_data[stock_file] = create_features(stock_data, fundamental_data, symbol)
+    
+    return nifty500_data, all_stock_data
+
+def prepare_model_data_for_all_stocks(all_stock_data, nifty500_data, horizon):
+    all_X = []
+    all_y = []
+    
+    for stock_file, stock_data in all_stock_data.items():
+        X, y = prepare_model_data(stock_data, nifty500_data, horizon)
+        market_condition = classify_market_condition(X['Returns'])
+        X['Market_Condition'] = market_condition
+        all_X.append(X)
+        all_y.append(y)
+        print(f"Processed {stock_file}")
+    
+    return pd.concat(all_X), pd.concat(all_y)
+
+def optimized_backtest(X, y, window_size=252, step_size=126, n_samples=20):
+    total_samples = (len(X) - window_size) // step_size
+    sample_indices = np.linspace(window_size, len(X) - step_size, min(total_samples, n_samples), dtype=int)
+    
+    def backtest_single(i):
+        X_train, y_train = X.iloc[:i], y.iloc[:i]
+        X_test, y_test = X.iloc[i:i+step_size], y.iloc[i:i+step_size]
+        
+        if X_test.empty or y_test.empty:
+            return None
+        
+        try:
+            preprocessor = create_preprocessor(X_train)
+            model = create_ensemble_model()
+            
+            pipeline = Pipeline([
+                ('preprocessor', preprocessor),
+                ('classifier', model)
+            ])
+            
+            pipeline.fit(X_train, y_train)
+            y_pred = pipeline.predict(X_test)
+            accuracy = accuracy_score(y_test, y_pred)
+            return {
+                'start_date': X_test.index[0],
+                'end_date': X_test.index[-1],
+                'accuracy': accuracy
+            }
+        except Exception as e:
+            print(f"Error in backtesting at index {i}: {str(e)}")
+            return None
+    
+    num_cores = multiprocessing.cpu_count()
+    results = Parallel(n_jobs=num_cores)(delayed(backtest_single)(i) for i in sample_indices)
+    results = [r for r in results if r is not None]
+    
+    return pd.DataFrame(results)
+
+def main():
+    data_dir = r"C:\Users\shubh\.cursor-tutor\stock_data"
+    nifty500_data, all_stock_data = load_and_prepare_all_data(data_dir, top_n=40)
+    
+    horizons = [5, 30, 180]
+    models = {}
+    
+    predictions = {horizon: {} for horizon in horizons}
+    
+    for horizon in horizons:
+        print(f"\nTraining model for {horizon}-day horizon")
+        X_combined, y_combined = prepare_model_data_for_all_stocks(all_stock_data, nifty500_data, horizon)
+        
+        print(f"Features used: {X_combined.columns.tolist()}")
+        
+        pipeline = train_and_evaluate_model(X_combined, y_combined)
+        models[horizon] = pipeline
+        
+        feature_importance_analysis(pipeline, X_combined, y_combined)
+        
+        print("\nBacktesting Results:")
+        backtest_results = optimized_backtest(X_combined, y_combined)
+        if not backtest_results.empty:
+            print(backtest_results.describe())
+        else:
+            print("No valid backtesting results.")
+    
+    print("\nPredictions for all 40 stocks:")
+    
+    for stock_file, stock_data in all_stock_data.items():
+        latest_data = stock_data.iloc[-1:][['Returns', 'Log_Returns', 'Volatility', 'MA50', 'MA200', 'RSI', 'Price_to_MA50', 'Price_to_MA200']]
+        market_condition = classify_market_condition(stock_data['Returns']).iloc[-1]
+        latest_data['Market_Condition'] = market_condition
+        
+        print(f"\nPredictions for {stock_file}:")
+        for horizon in horizons:
+            pipeline = models[horizon]
+            prob = pipeline.predict_proba(latest_data)[0][1]
+            print(f"{horizon}-day alpha probability: {prob:.4f}")
+            predictions[horizon][stock_file] = prob
+    
+    # Plot probabilities only once
+    print("Starting to plot probabilities...")
+    plot_probabilities(predictions)
+    print("Finished plotting probabilities.")
+
+    # Save results to JSON
+    print("Starting to save results to JSON...")
+    save_results_to_json(predictions)
+    print("Finished saving results to JSON.")
+
+    print("Script execution completed.")
+
+def enhanced_market_features(data, short_window=20, long_window=50, rsi_window=14, volatility_window=20):
+    # Trend
+    data['SMA_short'] = trend.sma_indicator(data['Close'], window=short_window)
+    data['SMA_long'] = trend.sma_indicator(data['Close'], window=long_window)
+    data['Trend'] = np.where(data['SMA_short'] > data['SMA_long'], 1, 
+                             np.where(data['SMA_short'] < data['SMA_long'], -1, 0))
+    
+    # Momentum
+    data['RSI'] = momentum.rsi(data['Close'], window=rsi_window)
+    data['Momentum'] = np.where(data['RSI'] > 70, 1, 
+                                np.where(data['RSI'] < 30, -1, 0))
+    
+    # Volatility
+    data['Volatility'] = volatility.average_true_range(data['High'], data['Low'], data['Close'], window=volatility_window)
+    data['Volatility_Regime'] = np.where(data['Volatility'] > data['Volatility'].quantile(0.75), 1, 
+                                         np.where(data['Volatility'] < data['Volatility'].quantile(0.25), -1, 0))
+    
+    return data
+
+def rsi_divergence(data, rsi_window=14, divergence_window=10):
+    data['RSI'] = momentum.rsi(data['Close'], window=rsi_window)
+    data['Price_High'] = data['Close'].rolling(window=divergence_window).max()
+    data['RSI_High'] = data['RSI'].rolling(window=divergence_window).max()
+    data['RSI_Divergence'] = np.where((data['Close'] >= data['Price_High']) & 
+                                      (data['RSI'] < data['RSI_High']), -1, 
+                                      np.where((data['Close'] <= data['Price_High']) & 
+                                               (data['RSI'] > data['RSI_High']), 1, 0))
+    return data
+
+def load_fundamental_data(data_dir):
+    fundamental_data = {}
+    fundamental_file = os.path.join(data_dir, 'fundamental_data.csv')
+    if os.path.exists(fundamental_file):
+        df = pd.read_csv(fundamental_file, index_col='Symbol')
+        fundamental_data = df.to_dict('index')
+    return fundamental_data
+
+plot_counter = 0
+
+def plot_probabilities(predictions):
+    global plot_counter
+    plot_counter += 1
+    print(f"plot_probabilities called {plot_counter} times")
+    if plot_counter > 1:
+        print(f"plot_probabilities called {plot_counter} times. Exiting.")
+        return
+    print("Starting to create DataFrame...")
+    horizons = list(predictions.keys())
+    stocks = list(predictions[horizons[0]].keys())
+    
+    df = pd.DataFrame({
+        horizon: [predictions[horizon][stock] for stock in stocks]
+        for horizon in horizons
+    }, index=stocks)
+    print("DataFrame created.")
+    
+    print("Starting to create bar plots...")
+    fig, axes = plt.subplots(len(horizons), 1, figsize=(15, 5*len(horizons)), sharex=True)
+    fig.suptitle('Alpha Probabilities for Different Time Horizons', fontsize=16)
+    
+    for i, horizon in enumerate(horizons):
+        print(f"Plotting {horizon}-day horizon...")
+        ax = axes[i] if len(horizons) > 1 else axes
+        sns.barplot(x=df.index, y=df[horizon], ax=ax)
+        ax.set_title(f'{horizon}-day Horizon')
+        ax.set_ylabel('Probability')
+        ax.set_xticks(range(len(stocks)))
+        ax.set_xticklabels(stocks, rotation=90, ha='right')
+    
+    print("Saving bar plot...")
+    plt.tight_layout()
+    plt.savefig('alpha_probabilities.png')
+    plt.close()
+    print("Bar plot saved.")
+    
+    print("Starting to create heatmap...")
+    plt.figure(figsize=(15, 10))
+    sns.heatmap(df.T, cmap='YlOrRd', annot=True, fmt='.2f', cbar_kws={'label': 'Probability'})
+    plt.title('Alpha Probabilities Heatmap')
+    plt.tight_layout()
+    print("Saving heatmap...")
+    plt.savefig('alpha_probabilities_heatmap.png')
+    plt.close()
+    print("Heatmap saved.")
+    print("plot_probabilities function completed")
+
+def save_results_to_json(predictions):
+    horizons = list(predictions.keys())
+    stocks = list(predictions[horizons[0]].keys())
+    
+    results = {
+        horizon: {
+            stock.split('_')[0]: predictions[horizon][stock]
+            for stock in stocks
+        }
+        for horizon in horizons
+    }
+    
+    with open('alpha_predictions.json', 'w') as f:
+        json.dump(results, f)
+
+if __name__ == "__main__":
+    main()
